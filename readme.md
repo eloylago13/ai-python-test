@@ -1,5 +1,7 @@
 ﻿# AI Engineer Challenge: Intelligent Notification Service
 
+> Documentación del proyecto: [arquitectura y decisiones técnicas](docs/architecture.md) · [desarrollo asistido por IA](docs/ai-development.md)
+
 ## El Reto
 Tu objetivo es implementar un servicio que procese entradas de lenguaje natural, extraiga información estructurada mediante un motor de IA y coordine el envío de notificaciones. La solución debe ser capaz de manejar la incertidumbre de los LLM (ruido en respuestas, formatos inconsistentes) y la latencia del procesamiento cognitivo.
 
@@ -58,6 +60,8 @@ El motor de IA y el servicio de notificaciones están disponibles en `localhost:
 2. **Tu aplicación:** `docker-compose up -d --build app`
 3. **Validación (k6):** `docker-compose run --rm load-test`
 4. **Resultados:** Visualiza el scorecard en tiempo real en [Grafana (localhost:3000)](http://localhost:3000/d/ia-performance-scorecard/)
+
+> **Persistencia local:** SQLite en `data/notifications.db` en local y en `/code/data/notifications.db` dentro de Docker (volumen `app-data`). Para producción, la idea es sustituirlo por PostgreSQL detrás del mismo puerto; ver ADR-012 en [docs/architecture.md](docs/architecture.md).
 
 ---
 *Se valorará la robustez frente a errores inesperados, la calidad del prompting y la arquitectura del pipeline de procesamiento.*
