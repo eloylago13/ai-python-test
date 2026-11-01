@@ -641,8 +641,9 @@ apagar, revisar `worker_pool_drain_timeout`.
 | `MAX_REQUEST_BYTES` | `65536` | Límite del cuerpo HTTP. |
 | `LOG_LEVEL` | `INFO` | Nivel de log. |
 
-En producción, `REPOSITORY_BACKEND` debe apuntar a la implementación Postgres
-(con migraciones, backups y `FOR UPDATE SKIP LOCKED`). SQLite es el adaptador
+En producción, el siguiente paso es implementar `PostgresRequestRepository`
+(con migraciones, backups y `FOR UPDATE SKIP LOCKED`) y seleccionarlo. Hoy
+`REPOSITORY_BACKEND` solo admite `sqlite` y `memory`; SQLite es el adaptador
 local, no la base multi-instancia.
 
 ---
@@ -681,16 +682,16 @@ Medición local con Docker Desktop, provider real y k6:
 | Métrica | Resultado |
 |---|---|
 | Escenario | 200 VUs, 40 s |
-| Checks | 19.208 / 100 % correctos |
+| Checks | 19.201 / 100 % correctos |
 | Fallos HTTP | 0 |
-| `http_req_duration` p95 | 4,45 ms |
-| `http_req_duration` p90 | 3,39 ms |
-| Peticiones HTTP | 8.232 (198,4/s) |
-| Iteraciones | 2.744 |
-| Estado tras la carga | 198 `sent`, 92 `ai_refused`, 1.891 en extracción y 514 en entrega |
+| `http_req_duration` p95 | 5,81 ms |
+| `http_req_duration` p90 | 4,37 ms |
+| Peticiones HTTP | 8.229 (198,3/s) |
+| Iteraciones | 2.743 |
+| Estado al drenar | 2.440 `sent`, 306 `ai_refused`, colas a 0 (acumulado de la sesión) |
 
 El backlog es el comportamiento esperado: el proveedor limita la entrega a 50
-notificaciones cada 10 s. La API mantuvo p95 por debajo de 5 ms porque el
+notificaciones cada 10 s. La API mantuvo p95 por debajo de 6 ms porque el
 `/process` solo encola. El build de la imagen, el healthcheck del contenedor y
 la condición `service_healthy` de compose también se validaron en esta prueba.
 Además se verificó que el estado sobrevive a un reinicio del contenedor y que
