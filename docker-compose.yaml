@@ -5,8 +5,19 @@ services:
       dockerfile: Dockerfile
     container_name: ia-app
     network_mode: "service:provider"
+    environment:
+      - REPOSITORY_BACKEND=sqlite
+      - SQLITE_PATH=/code/data/notifications.db
+    volumes:
+      - app-data:/code/data
     depends_on:
       - provider
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health/live')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
 
   provider:
     build:
@@ -30,7 +41,7 @@ services:
       - TARGET_URL=http://provider:5000
     depends_on:
       app:
-        condition: service_started
+        condition: service_healthy
       provider:
         condition: service_healthy
       influxdb:
@@ -71,3 +82,6 @@ services:
     command: run /scripts/health-check.js
     depends_on:
       - provider
+
+volumes:
+  app-data:
