@@ -1,8 +1,5 @@
 # Servicio de notificaciones: arquitectura y decisiones técnicas
 
-**Estado:** activo  
-**Audiencia:** cualquier persona que se incorpore al proyecto  
-**Última revisión:** 2026-10-29
 
 Este documento explica qué hace el servicio, por qué está construido así y qué
 trade-offs hemos aceptado. No es una guía de la prueba de integración: es la
@@ -31,18 +28,18 @@ límite de notificaciones (50 cada 10 s) contaminen la latencia de la API.
 
 ```mermaid
 flowchart LR
-    Client[Cliente interno] -->|POST /v1/requests| API[API FastAPI]
-    Client -->|POST /v1/requests/{id}/process| API
-    Client -->|GET /v1/requests/{id}| API
-    API --> Repo[(Repositorio de peticiones)]
-    API --> ExtQ[[Cola de extracción]]
-    ExtQ --> ExtWorkers[Workers de extracción]
-    ExtWorkers -->|/v1/ai/extract| AI[Proveedor de IA]
-    ExtWorkers --> Guardrails[Guardrails]
+    Client["Cliente interno"] -->|"POST /v1/requests"| API["API FastAPI"]
+    Client -->|"POST /v1/requests/:id/process"| API
+    Client -->|"GET /v1/requests/:id"| API
+    API --> Repo["Repositorio de peticiones"]
+    API --> ExtQ["Cola de extracción"]
+    ExtQ --> ExtWorkers["Workers de extracción"]
+    ExtWorkers -->|"/v1/ai/extract"| AI["Proveedor de IA"]
+    ExtWorkers --> Guardrails["Guardrails"]
     Guardrails --> Repo
-    Guardrails --> DelQ[[Cola de entrega]]
-    DelQ --> DelWorkers[Workers de entrega]
-    DelWorkers -->|/v1/notify| Notify[Proveedor de notificaciones]
+    Guardrails --> DelQ["Cola de entrega"]
+    DelQ --> DelWorkers["Workers de entrega"]
+    DelWorkers -->|"/v1/notify"| Notify["Proveedor de notificaciones"]
     DelWorkers --> Repo
 ```
 
@@ -139,9 +136,9 @@ sequenceDiagram
 
     C->>A: POST /v1/requests
     A->>R: create(user_input)
-    A-->>C: 201 {"id"}
+    A-->>C: 201 con id
 
-    C->>A: POST /v1/requests/{id}/process
+    C->>A: POST /v1/requests/:id/process
     A->>R: claim_for_processing(id)
     A->>EQ: put_nowait(id)
     A-->>C: 202 processing
@@ -159,9 +156,9 @@ sequenceDiagram
     P-->>D: delivered
     D->>R: mark_sent(provider_id)
 
-    C->>A: GET /v1/requests/{id}
+    C->>A: GET /v1/requests/:id
     A->>R: get(id)
-    A-->>C: 200 {"status": "sent"}
+    A-->>C: 200 con status sent
 ```
 
 ### 5.3 Máquina de estados
@@ -170,10 +167,10 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> queued: create
     queued --> processing: claim
-    processing --> processing: extract / retry
+    processing --> processing: extract o retry
     processing --> sent: notify OK
     processing --> failed: error terminal
-    processing --> queued: release (cola llena)
+    processing --> queued: release por cola llena
     sent --> [*]
     failed --> [*]
 ```

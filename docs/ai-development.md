@@ -68,13 +68,13 @@ sigue disponible para tareas generales que no requieran el flujo anterior.
 
 ```mermaid
 flowchart LR
-    B[Brief o ticket] --> D[/discover/]
-    D --> A[/design/]
-    A --> I[/implement/]
-    I --> T[/test/]
-    T --> R[/review/]
-    R --> V[/verify/]
-    V --> H[Revisión humana y Git]
+    B["Brief o ticket"] --> D["/discover"]
+    D --> A["/design"]
+    A --> I["/implement"]
+    I --> T["/test"]
+    T --> R["/review"]
+    R --> V["/verify"]
+    V --> H["Revisión humana y Git"]
 ```
 
 **Regla práctica:** si el cambio es pequeño y el contrato ya está claro, se
