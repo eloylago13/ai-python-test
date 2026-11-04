@@ -99,6 +99,23 @@ _SMS_TYPES = {
     "movil",
 }
 
+_MAX_MESSAGE_CHARS = 2_000
+
+_REASON_TO_ERROR = {
+    "ambiguous_destination": ErrorCode.AMBIGUOUS_DESTINATION,
+    "message_incomplete": ErrorCode.MESSAGE_INCOMPLETE,
+    "message_too_long": ErrorCode.MESSAGE_TOO_LONG,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _DestinationCandidate:
+    value: str
+    type: NotificationType
+    start: int
+    end: int
+    explicit: bool
+
 
 @dataclass(frozen=True, slots=True)
 class ExtractionOutcome:
@@ -165,7 +182,7 @@ def parse_llm_output(raw: str, user_input: str) -> ExtractionOutcome:
         )
     if saw_mapping:
         return ExtractionOutcome(
-            error_code=ErrorCode.EXTRACTION_FAILED,
+            error_code=_error_for_reason(last_reason),
             reason=last_reason,
         )
     return ExtractionOutcome(
@@ -178,43 +195,29 @@ def deterministic_extract(user_input: str) -> ExtractionOutcome:
     """Last-resort extractor used only when the AI response is unusable.
 
     It never overrides a policy refusal. It is intentionally conservative: it
-    needs a valid destination, and it derives the message from explicit markers
-    in the request instead of inventing content.
+    needs a destination explicitly present in the user input, and it derives the
+    message from that input instead of inventing content.
     """
 
     text = _normalize_text(user_input)
     if not text:
-        return ExtractionOutcome(
-            error_code=ErrorCode.EXTRACTION_FAILED,
-            reason="empty_user_input",
-            source="deterministic",
-        )
+        return _failure("empty_user_input", source="deterministic")
 
-    email = _find_email(text)
-    phone = _find_phone(text)
-    notification_type = _infer_type_from_text(text, email, phone)
-    if notification_type is NotificationType.EMAIL and email:
-        destination = email
-    elif notification_type is NotificationType.SMS and phone:
-        destination = phone
-    elif email and not phone:
-        destination, notification_type = email, NotificationType.EMAIL
-    elif phone and not email:
-        destination, notification_type = phone, NotificationType.SMS
-    else:
-        return ExtractionOutcome(
-            error_code=ErrorCode.EXTRACTION_FAILED,
-            reason="missing_or_ambiguous_destination",
-            source="deterministic",
-        )
+    guessed_type = _infer_type_from_text(text)
+    destination, notification_type, reason = _resolve_requested_destination(
+        text,
+        guessed_type,
+    )
+    if destination is None:
+        return _failure(reason, source="deterministic")
 
-    message = _derive_message(text)
+    message = _derive_message(text, destination)
     if not message:
-        return ExtractionOutcome(
-            error_code=ErrorCode.EXTRACTION_FAILED,
-            reason="missing_message",
-            source="deterministic",
-        )
+        return _failure("missing_message", source="deterministic")
+    if len(message) > _MAX_MESSAGE_CHARS:
+        return _failure("message_too_long", source="deterministic")
+    if _message_is_incomplete(message, text, None):
+        return _failure("message_incomplete", source="deterministic")
 
     return ExtractionOutcome(
         notification=Notification(
@@ -234,56 +237,285 @@ def _build_notification(
 
     type_raw = _coerce_scalar(canonical.get("type"))
     notification_type = _normalize_type(type_raw)
-    if notification_type is None:
-        inferred_type = _infer_type_from_destination(
-            _coerce_scalar(canonical.get("to"))
-        ) or _infer_type_from_text(user_input)
-        if inferred_type is not None:
-            notification_type = inferred_type
-            inferred.append("type")
 
-    destination = _normalize_destination(
-        _coerce_scalar(canonical.get("to")), notification_type
+    # The destination is resolved from the original request, never from the
+    # model alone. This prevents a hallucinated address, or an example copied
+    # from the system prompt, from becoming the recipient.
+    destination, resolved_type, reason = _resolve_requested_destination(
+        user_input,
+        notification_type,
     )
-    if not destination:
-        destination, text_type = _destination_from_text(user_input)
-        if destination:
-            inferred.append("to")
-            if text_type is not None and (
-                notification_type is None or notification_type is not text_type
-            ):
-                notification_type = text_type
-                inferred.append("type")
-
-    if not destination:
-        return None, tuple(inferred), "missing_or_invalid_destination"
+    if destination is None:
+        return None, tuple(inferred), reason
 
     if notification_type is None:
-        notification_type = _infer_type_from_destination(destination)
-        if notification_type is None:
-            return None, tuple(inferred), "missing_type"
+        notification_type = resolved_type
+        inferred.append("type")
+    elif notification_type is not resolved_type:
+        notification_type = resolved_type
         inferred.append("type")
 
+    llm_destination = _normalize_destination(
+        _coerce_scalar(canonical.get("to")),
+        notification_type,
+    )
+    if llm_destination is None or not _same_destination(
+        llm_destination,
+        destination,
+        notification_type,
+    ):
+        inferred.append("to")
+
     message = _normalize_message(_coerce_scalar(canonical.get("message")))
-    derived_message = _derive_message(user_input)
+    derived_message = _derive_message(user_input, destination)
     if derived_message and _should_prefer_derived(
         message, derived_message, user_input, destination
     ):
         if message != derived_message:
             inferred.append("message")
         message = derived_message
+
     if not message:
-        message = _normalize_message(user_input)
+        message = derived_message or _normalize_message(user_input)
         if message:
             inferred.append("message")
     if not message:
         return None, tuple(inferred), "missing_message"
+
+    if _message_is_incomplete(message, user_input, derived_message):
+        if derived_message and message != derived_message:
+            message = derived_message
+            inferred.append("message")
+        else:
+            return None, tuple(inferred), "message_incomplete"
+
+    if len(message) > _MAX_MESSAGE_CHARS:
+        return None, tuple(inferred), "message_too_long"
 
     return (
         Notification(to=destination, message=message, type=notification_type),
         tuple(dict.fromkeys(inferred)),
         "",
     )
+
+
+def _error_for_reason(reason: str) -> ErrorCode:
+    return _REASON_TO_ERROR.get(reason, ErrorCode.EXTRACTION_FAILED)
+
+
+def _failure(reason: str, *, source: str) -> ExtractionOutcome:
+    return ExtractionOutcome(
+        error_code=_error_for_reason(reason),
+        reason=reason,
+        source=source,
+    )
+
+
+def _destination_candidates(text: str) -> list[_DestinationCandidate]:
+    candidates: list[_DestinationCandidate] = []
+
+    for match in _EMAIL_RE.finditer(text):
+        email = match.group(1).strip().strip(".,;:")
+        if len(email) > 254:
+            continue
+        candidates.append(
+            _DestinationCandidate(
+                value=email,
+                type=NotificationType.EMAIL,
+                start=match.start(1),
+                end=match.end(1),
+                explicit=_is_explicit_destination(text, match.start(1)),
+            )
+        )
+
+    for match in _PHONE_RE.finditer(text):
+        raw = match.group(1).strip()
+        if _DATE_RE.fullmatch(raw):
+            continue
+        phone = _normalize_phone(raw)
+        if phone is None:
+            continue
+        candidates.append(
+            _DestinationCandidate(
+                value=phone,
+                type=NotificationType.SMS,
+                start=match.start(1),
+                end=match.end(1),
+                explicit=_is_explicit_destination(text, match.start(1)),
+            )
+        )
+
+    boundary = _message_boundary(text, candidates)
+    if boundary is not None:
+        before_message = [
+            candidate for candidate in candidates if candidate.start < boundary
+        ]
+        if before_message and any(
+            candidate.explicit for candidate in before_message
+        ):
+            candidates = before_message
+
+    deduped: dict[tuple[NotificationType, str], _DestinationCandidate] = {}
+    for candidate in candidates:
+        key = (
+            candidate.type,
+            candidate.value.casefold()
+            if candidate.type is NotificationType.EMAIL
+            else candidate.value,
+        )
+        previous = deduped.get(key)
+        if previous is None or (candidate.explicit and not previous.explicit):
+            deduped[key] = candidate
+    return list(deduped.values())
+
+
+def _message_boundary(
+    text: str,
+    candidates: list[_DestinationCandidate],
+) -> int | None:
+    lower = text.lower()
+    marker_indexes = [
+        lower.find(marker)
+        for marker in ("diciendo", "con el mensaje", "mensaje:", "aviso:", "texto:")
+        if lower.find(marker) != -1
+    ]
+    if marker_indexes:
+        return min(marker_indexes)
+
+    colon_index = text.find(":")
+    if colon_index != -1 and any(
+        candidate.end <= colon_index for candidate in candidates
+    ):
+        return colon_index
+    return None
+
+
+def _is_explicit_destination(text: str, start: int) -> bool:
+    prefix = text[max(0, start - 60) : start].lower()
+
+    if re.search(r"\b(?:no|nunca)\s+(?:a|al|para|to)\s*$", prefix):
+        return False
+    if re.search(
+        r"\b(?:de|desde|from|original|anterior|remitente|origen)\s*:?\s*$",
+        prefix,
+    ):
+        return False
+    if re.search(r"\b(?:destinatario|destino)\s*:?\s*$", prefix):
+        return True
+    if re.search(r"(?:,|;|/|\b(?:y|e|o|u))\s*$", prefix):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:a|al|para|to)\s+(?:[a-z0-9]+\s+){0,3}$",
+            prefix,
+        )
+    )
+
+
+def _resolve_requested_destination(
+    user_input: str,
+    requested_type: NotificationType | None,
+) -> tuple[str | None, NotificationType | None, str]:
+    text = _normalize_text(user_input)
+    candidates = _destination_candidates(text)
+    if not candidates:
+        return None, None, "missing_destination"
+
+    if requested_type is not None:
+        typed = [
+            candidate
+            for candidate in candidates
+            if candidate.type is requested_type
+        ]
+        if typed:
+            candidates = typed
+        elif len(candidates) == 1:
+            requested_type = candidates[0].type
+        else:
+            return None, None, "destination_type_mismatch"
+
+    explicit = [candidate for candidate in candidates if candidate.explicit]
+    if explicit:
+        unique_explicit = {
+            (
+                candidate.type,
+                candidate.value.casefold()
+                if candidate.type is NotificationType.EMAIL
+                else candidate.value,
+            ): candidate
+            for candidate in explicit
+        }
+        if len(unique_explicit) == 1:
+            candidate = next(iter(unique_explicit.values()))
+            return candidate.value, candidate.type, ""
+        return None, None, "ambiguous_destination"
+
+    unique = {
+        (
+            candidate.type,
+            candidate.value.casefold()
+            if candidate.type is NotificationType.EMAIL
+            else candidate.value,
+        ): candidate
+        for candidate in candidates
+    }
+    if len(unique) == 1:
+        candidate = next(iter(unique.values()))
+        return candidate.value, candidate.type, ""
+    return None, None, "ambiguous_destination"
+
+
+def _same_destination(
+    left: str,
+    right: str,
+    notification_type: NotificationType,
+) -> bool:
+    if notification_type is NotificationType.EMAIL:
+        return left.casefold() == right.casefold()
+    return left == right
+
+
+def _message_is_incomplete(
+    message: str,
+    user_input: str,
+    derived_message: str | None,
+) -> bool:
+    if not message:
+        return True
+
+    normalized_input = _normalize_message(user_input) or ""
+    if (
+        len(message) < len(normalized_input)
+        and normalized_input.startswith(message)
+    ):
+        next_char = normalized_input[len(message)]
+        if message[-1].isalnum() and next_char.isalnum():
+            return True
+
+    if (
+        len(message) < len(normalized_input)
+        and message.endswith(("...", "…"))
+    ):
+        return True
+
+    if (
+        derived_message
+        and len(message) < len(derived_message)
+        and derived_message.startswith(message)
+    ):
+        next_char = derived_message[len(message)]
+        if message[-1].isalnum() and (
+            next_char.isalnum() or len(derived_message) > len(message) + 1
+        ):
+            return True
+
+    if (
+        len(user_input) > 50
+        and message == _normalize_message(user_input[:50])
+    ):
+        return True
+
+    return False
 
 
 def _candidates(text: str) -> list[str]:
@@ -572,38 +804,6 @@ def _normalize_destination(
     return _find_email(text) or _find_phone(text)
 
 
-def _destination_from_text(
-    text: str,
-) -> tuple[str | None, NotificationType | None]:
-    email = _find_email(text)
-    phone = _find_phone(text)
-    inferred = _infer_type_from_text(text, email, phone)
-
-    if inferred is NotificationType.EMAIL and email:
-        return email, NotificationType.EMAIL
-    if inferred is NotificationType.SMS and phone:
-        return phone, NotificationType.SMS
-    if email and not phone:
-        return email, NotificationType.EMAIL
-    if phone and not email:
-        return phone, NotificationType.SMS
-    if email:
-        return email, NotificationType.EMAIL
-    if phone:
-        return phone, NotificationType.SMS
-    return None, None
-
-
-def _infer_type_from_destination(value: Any) -> NotificationType | None:
-    if not isinstance(value, str):
-        return None
-    if _find_email(value):
-        return NotificationType.EMAIL
-    if _find_phone(value):
-        return NotificationType.SMS
-    return None
-
-
 def _infer_type_from_text(
     text: str,
     email: str | None = None,
@@ -675,8 +875,6 @@ def _normalize_message(value: Any) -> str | None:
     text = _WHITESPACE_RE.sub(" ", text).strip()
     if not text:
         return None
-    if len(text) > 1000:
-        text = text[:997].rstrip() + "..."
     return text
 
 
@@ -701,6 +899,10 @@ def _should_prefer_derived(
         return False
     if len(message) <= 3 and len(derived) > len(message):
         return True
+    if derived.startswith(message) and len(derived) > len(message) + 1:
+        return True
+    if message.endswith(("...", "…")) and len(derived) > len(message):
+        return True
     if message == _normalize_message(user_input[:50]):
         return True
     if destination and destination in message:
@@ -714,39 +916,59 @@ def _should_prefer_derived(
     return False
 
 
-def _derive_message(user_input: str) -> str | None:
+def _derive_message(
+    user_input: str,
+    destination: str | None = None,
+) -> str | None:
     text = _normalize_text(user_input)
     if not text:
         return None
 
-    email = _find_email(text)
-    phone = _find_phone(text)
     lower = text.lower()
-
     for marker in ("diciendo", "con el mensaje", "mensaje:", "aviso:", "texto:"):
         index = lower.find(marker)
         if index == -1:
             continue
         candidate = text[index + len(marker) :].lstrip(" :,-")
         candidate = re.sub(r"^que\s+", "", candidate, flags=re.IGNORECASE)
-        message = _normalize_message(candidate)
+        message = _clean_derived_message(candidate)
         if message:
             return message
 
     destination_end = -1
-    if email:
-        destination_end = max(destination_end, lower.find(email.lower()) + len(email))
-    if phone:
-        for match in _PHONE_RE.finditer(text):
-            destination_end = max(destination_end, match.end())
+    if destination:
+        if "@" in destination:
+            index = lower.find(destination.casefold())
+            if index != -1:
+                destination_end = index + len(destination)
+        else:
+            for match in _PHONE_RE.finditer(text):
+                if _normalize_phone(match.group(1)) == destination:
+                    destination_end = match.end()
+                    break
+            if destination_end == -1:
+                index = text.find(destination)
+                if index != -1:
+                    destination_end = index + len(destination)
+    else:
+        email = _find_email(text)
+        phone = _find_phone(text)
+        if email:
+            destination_end = max(
+                destination_end,
+                lower.find(email.lower()) + len(email),
+            )
+        if phone:
+            for match in _PHONE_RE.finditer(text):
+                destination_end = max(destination_end, match.end())
 
-    # Use the first colon after the destination, not the last one. The latter
-    # would turn "cita a las 10:00" into "00".
+    # Use the first colon after the selected destination, not the last one. The
+    # latter would turn "cita a las 10:00" into "00".
     colon_index = text.find(":", destination_end if destination_end != -1 else 0)
     if colon_index != -1:
         after = text[colon_index + 1 :]
         if after.strip() and not re.fullmatch(r"\d{1,2}:\d{2}", after.strip()):
-            message = _normalize_message(after)
+            message = _clean_derived_message(after)
             if message:
                 return message
 
@@ -754,11 +976,43 @@ def _derive_message(user_input: str) -> str | None:
         rest = text[destination_end:]
         match = re.search(r"\bque\s+(.+)", rest, re.IGNORECASE | re.DOTALL)
         if match:
-            message = _normalize_message(match.group(1))
+            message = _clean_derived_message(match.group(1))
             if message:
                 return message
 
+        rest = rest.lstrip(" :,-")
+        rest = re.sub(
+            r"^(?:diciendo|que|con el mensaje|mensaje|aviso|texto)\s+",
+            "",
+            rest,
+            flags=re.IGNORECASE,
+        )
+        message = _clean_derived_message(rest)
+        if message:
+            return message
+
     return None
+
+
+def _clean_derived_message(value: str) -> str | None:
+    """Remove meta clauses such as "el original era de otro@test.com"."""
+
+    parts = re.split(r"\s*;\s*", value)
+    if len(parts) > 1:
+        kept = [parts[0]]
+        for part in parts[1:]:
+            folded = _fold(part)
+            if (
+                "original" in folded
+                or "remitente" in folded
+                or _find_email(part) is not None
+                or _find_phone(part) is not None
+            ):
+                continue
+            kept.append(part)
+        value = "; ".join(kept)
+
+    return _normalize_message(value)
 
 
 def _normalize_key(key: Any) -> str:
