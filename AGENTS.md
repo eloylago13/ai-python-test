@@ -58,6 +58,9 @@ docker compose run --rm load-test
 - No loguear `user_input`, destinatarios, mensajes ni secretos.
 - Los errores de negocio se modelan con `ErrorCode`; no se devuelven trazas.
 - Los cambios de prompt se tratan como cambios de contrato: tests y revisión.
+- El destinatario se resuelve desde el texto original; no se confía en el `to`
+  del LLM. Varios destinos ambiguos fallan con `ambiguous_destination`. El
+  mensaje no se trunca: incompleto → `message_incomplete`; más de 2000 → `message_too_long`.
 - Persistencia local con SQLite (`data/notifications.db`); producción debe usar
   un adaptador Postgres detrás del mismo puerto. No versionar `app/data/` ni
   archivos `*.db`.

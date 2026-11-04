@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from notification.domain.guardrails import deterministic_extract, parse_llm_output
@@ -273,3 +275,137 @@ def test_deterministic_extraction_requires_a_destination() -> None:
 
     assert not outcome.ok
     assert outcome.error_code is ErrorCode.EXTRACTION_FAILED
+
+
+def test_destination_is_grounded_in_the_user_input() -> None:
+    outcome = parse_llm_output(
+        '{"to": "a@test.com", "message": "hola", "type": "email"}',
+        "Reenvia el mensaje a b@test.com; el original era de a@test.com",
+    )
+
+    assert outcome.ok
+    assert outcome.notification is not None
+    assert outcome.notification.to == "b@test.com"
+    assert "to" in outcome.inferred_fields
+
+
+def test_example_address_from_the_prompt_is_not_used_as_recipient() -> None:
+    outcome = parse_llm_output(
+        '{"to": "juan@example.com", "message": "Su paquete esta en camino.", "type": "email"}',
+        "Manda un mail a feda@test.com diciendo que su paquete esta en camino.",
+    )
+
+    assert outcome.ok
+    assert outcome.notification is not None
+    assert outcome.notification.to == "feda@test.com"
+    assert "to" in outcome.inferred_fields
+
+
+def test_destination_after_message_marker_is_still_detected() -> None:
+    outcome = parse_llm_output(
+        '{"to": "b@test.com", "message": "hola", "type": "email"}',
+        "El original era de a@test.com; manda un mensaje: a b@test.com",
+    )
+
+    assert outcome.ok
+    assert outcome.notification is not None
+    assert outcome.notification.to == "b@test.com"
+
+
+def test_email_inside_the_message_is_not_treated_as_destination() -> None:
+    outcome = parse_llm_output(
+        '{"to": "b@test.com", "message": "Escribe a a@test.com", "type": "email"}',
+        "Manda un mail a b@test.com: Escribe a a@test.com",
+    )
+
+    assert outcome.ok
+    assert outcome.notification is not None
+    assert outcome.notification.to == "b@test.com"
+
+
+def test_ambiguous_destination_is_rejected() -> None:
+    outcome = parse_llm_output(
+        '{"to": "a@test.com", "message": "hola", "type": "email"}',
+        "Envia el mensaje a a@test.com y tambien a b@test.com",
+    )
+
+    assert not outcome.ok
+    assert outcome.error_code is ErrorCode.AMBIGUOUS_DESTINATION
+
+
+def test_continuation_destination_is_considered_ambiguous() -> None:
+    outcome = parse_llm_output(
+        '{"to": "a@test.com", "message": "hola", "type": "email"}',
+        "Envia el mensaje a a@test.com y b@test.com",
+    )
+
+    assert not outcome.ok
+    assert outcome.error_code is ErrorCode.AMBIGUOUS_DESTINATION
+
+
+def test_destination_that_does_not_appear_in_input_is_rejected() -> None:
+    outcome = parse_llm_output(
+        '{"to": "juan@example.com", "message": "hola", "type": "email"}',
+        "Manda un mensaje diciendo hola",
+    )
+
+    assert not outcome.ok
+    assert outcome.error_code is ErrorCode.EXTRACTION_FAILED
+
+
+def test_incomplete_message_is_completed_from_the_user_input() -> None:
+    outcome = parse_llm_output(
+        '{"to": "b@test.com", "message": "Hola, tu ped", "type": "email"}',
+        "Manda un mail a b@test.com: Hola, tu pedido esta en camino",
+    )
+
+    assert outcome.ok
+    assert outcome.notification is not None
+    assert outcome.notification.message == "Hola, tu pedido esta en camino"
+    assert "message" in outcome.inferred_fields
+
+
+def test_long_message_is_not_silently_truncated() -> None:
+    message = "A" * 1_200
+    raw = json.dumps(
+        {"to": "b@test.com", "message": message, "type": "email"}
+    )
+    outcome = parse_llm_output(raw, f"Manda un mail a b@test.com: {message}")
+
+    assert outcome.ok
+    assert outcome.notification is not None
+    assert outcome.notification.message == message
+    assert len(outcome.notification.message) == 1_200
+    assert not outcome.notification.message.endswith("...")
+
+
+def test_message_over_the_limit_is_rejected() -> None:
+    message = "A" * 2_500
+    raw = json.dumps(
+        {"to": "b@test.com", "message": message, "type": "email"}
+    )
+    outcome = parse_llm_output(raw, f"Manda un mail a b@test.com: {message}")
+
+    assert not outcome.ok
+    assert outcome.error_code is ErrorCode.MESSAGE_TOO_LONG
+
+
+def test_deterministic_extraction_respects_explicit_destination() -> None:
+    outcome = deterministic_extract(
+        "Reenvia a b@test.com el mensaje diciendo hola; "
+        "el original era de a@test.com"
+    )
+
+    assert outcome.ok
+    assert outcome.notification is not None
+    assert outcome.notification.to == "b@test.com"
+    assert outcome.notification.message == "hola"
+
+
+def test_deterministic_extraction_rejects_ambiguous_destination() -> None:
+    outcome = deterministic_extract(
+        "Envia a a@test.com y a b@test.com diciendo hola"
+    )
+
+    assert not outcome.ok
+    assert outcome.error_code is ErrorCode.AMBIGUOUS_DESTINATION

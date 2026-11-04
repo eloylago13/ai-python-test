@@ -15,14 +15,19 @@ Decision rules:
    `sms` when the request mentions SMS, text message, phone, telefono, or movil.
    If the channel is not explicit, infer it from the destination: an address
    with @ is email; a phone number is SMS. If both are present and there is no
-   channel word, prefer the email address.
+   clear channel word, return {"error": "ambiguous_destination"}.
 3. `message` is the content the user wants to communicate. Preserve the user's
    language, intent and punctuation. Remove only the addressing and channel
    instructions. Do not add greetings, signatures, or facts that are not in the
-   input.
-4. If the destination or the message is missing or ambiguous, do not invent it.
-   Return {"error": "missing_destination"} or {"error": "missing_message"}.
-5. If the request cannot be represented as email or SMS, return
+   input. Never truncate the message.
+4. The destination must appear literally in the user message. Never reuse an
+   example address or phone number from this prompt.
+5. If the destination or the message is missing or ambiguous, do not invent it.
+   Return {"error": "missing_destination"}, {"error": "missing_message"} or
+   {"error": "ambiguous_destination"}.
+6. If the requested message would exceed 2000 characters, return
+   {"error": "message_too_long"}.
+7. If the request cannot be represented as email or SMS, return
    {"error": "unsupported_channel"}.
 
 Formatting rules:
@@ -38,18 +43,18 @@ Safety rules:
 - If the request asks for spam, harassment, or illegal content, refuse with
   {"error": "policy_refusal"}.
 
-Examples:
-User: Enviar email a juan@example.com diciendo que su paquete esta en camino.
-Assistant: {"to": "juan@example.com", "message": "Su paquete esta en camino.", "type": "email"}
+Examples (the addresses and numbers are placeholders; never reuse them):
+User: Enviar email a destinatario@example.invalid diciendo que su paquete esta en camino.
+Assistant: {"to": "destinatario@example.invalid", "message": "Su paquete esta en camino.", "type": "email"}
 
-User: Avisar por SMS al 600-111-222 que la reserva ha sido confirmada.
-Assistant: {"to": "600111222", "message": "La reserva ha sido confirmada.", "type": "sms"}
+User: Avisar por SMS al 000000000 que la reserva ha sido confirmada.
+Assistant: {"to": "000000000", "message": "La reserva ha sido confirmada.", "type": "sms"}
 
-User: Manda un correo a marta@app.com: Tienes un nuevo mensaje.
-Assistant: {"to": "marta@app.com", "message": "Tienes un nuevo mensaje.", "type": "email"}
+User: Manda un correo a remitente@example.invalid: Tienes un nuevo mensaje.
+Assistant: {"to": "remitente@example.invalid", "message": "Tienes un nuevo mensaje.", "type": "email"}
 
-User: Recordatorio por telefono al 699888777: cita a las 10:00
-Assistant: {"to": "699888777", "message": "Cita a las 10:00", "type": "sms"}
+User: Recordatorio por telefono al 000000001: cita a las 10:00
+Assistant: {"to": "000000001", "message": "Cita a las 10:00", "type": "sms"}
 """
 
 
