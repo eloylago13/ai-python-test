@@ -273,18 +273,26 @@ simples, claves sin comillas, campos ausentes o rechazos.
 3. Cargar: `json.loads`, `ast.literal_eval` y reparación.
 4. Canonicalizar claves: `to`/`recipient`/`destination`, `message`/`body`/`text`,
    `type`/`channel`/`method`.
-5. Normalizar valores: email, teléfono, tipo y mensaje.
-6. Validar con reglas de dominio.
-7. Si la salida no es recuperable, intentar un extractor determinista desde el
+5. Resolver el destino desde el texto original. Si no aparece, se ignora el
+   destino inventado por el modelo. Si hay varios y no hay uno explícito, se
+   falla con `ambiguous_destination`.
+6. Normalizar valores: email, teléfono, tipo y mensaje.
+7. Validar con reglas de dominio, incluida la integridad del mensaje. No se
+   trunca en silencio: si está incompleto o supera el límite, se rechaza.
+8. Si la salida no es recuperable, intentar un extractor determinista desde el
    texto original.
-8. Si la IA rechaza por política, **no** aplicar fallback: se marca `failed`.
+9. Si la IA rechaza por política, **no** aplicar fallback: se marca `failed`.
 
 **Consecuencias.**
 
 - La tasa de extracción útil sube sin ocultar errores reales.
+- El destinatario siempre procede de la petición, no de un ejemplo o de una
+  alucinación del modelo.
 - El fallback es una degradación observable (`source=deterministic` en logs).
 - El fallback no sustituye a la IA: solo se usa cuando la salida es inservible.
 - Un rechazo de política se respeta y se registra como `ai_refused`.
+- Un mensaje incompleto o demasiado largo falla con un código explícito; no se
+  envía a medias.
 
 ### ADR-004: límite de tasa en cliente y reintentos en el adaptador
 
@@ -315,7 +323,9 @@ ejemplos viven en el sistema.
 
 **Consecuencias.**
 
-- El modelo no extrae direcciones de los ejemplos por accidente.
+- Los ejemplos usan dominios `.invalid` y números ficticios.
+- Aunque el modelo copie un ejemplo, el guardrail exige que el destino aparezca
+  en la entrada del usuario.
 - El contrato es explícito y versionable en `domain/prompt.py`.
 - La calidad del prompt se puede evaluar de forma independiente.
 - Si se cambia el esquema, hay que actualizar prompt y guardrails a la vez.
@@ -328,8 +338,8 @@ pueden competir por el mismo registro.
 **Decisión.** El repositorio expone transiciones con lock (`claim_for_processing`,
 `mark_extracted`, `claim_delivery`, `mark_sent`, `mark_failed`). Los errores se
 clasifican con `ErrorCode`: IA no disponible, rechazo, respuesta inválida,
-extracción fallida, rate limit, proveedor no disponible, proveedor rechaza,
-error interno.
+extracción fallida, destino ambiguo, mensaje incompleto, mensaje demasiado
+largo, rate limit, proveedor no disponible, proveedor rechaza y error interno.
 
 **Consecuencias.**
 
@@ -468,8 +478,12 @@ adaptador en memoria queda para tests. La idea de producción es implementar un
 | Claves alternativas (`Recipient`, `body`, `channel`) | Canonicalización por alias. |
 | Campos extra (`confidence`, `latency_ms`) | Se ignoran. |
 | Tipo ausente | Se infiere del destino o del texto original. |
-| Destino ausente | Se busca en el texto original. |
+| Destino ausente | Se resuelve del texto original; si no aparece, `missing_destination`. |
+| Destino del LLM distinto al de la petición | Se reemplaza por el destino de la petición; se registra `to` inferido. |
+| Varios destinos | Se elige el explícito tras `a`/`al`/`para`; si no hay uno claro, `ambiguous_destination`. |
 | Mensaje ausente | Se deriva del texto original. |
+| Mensaje truncado | Se completa con el texto original o falla con `message_incomplete`. |
+| Mensaje de más de 2000 caracteres | `message_too_long`; no se trunca en silencio. |
 | Bloque ```json``` o ``` ``` | Se extrae el contenido y se parsea. |
 | JSON embebido en prosa | Se localiza el objeto balanceado. |
 | JSON truncado | Se elimina la elipsis y se cierra el objeto. |
@@ -512,6 +526,10 @@ explícita y auditada.
 |---|---|---|
 | Timeout o 5xx de IA | Reintentos con backoff; luego fallback determinista si es posible. | `sent` o `failed`. |
 | JSON irrecuperable | Reintento de extracción y fallback. | `sent` o `failed`. |
+| Destino inventado por el LLM | Se descarta y se usa el destino del texto original. | `sent` con `to` inferido. |
+| Varios destinos sin uno explícito | No se adivina. | `failed` (`ambiguous_destination`). |
+| Mensaje truncado | Se completa desde el texto original. | `sent` o `failed` (`message_incomplete`). |
+| Mensaje de más de 2000 caracteres | No se trunca en silencio. | `failed` (`message_too_long`). |
 | Rechazo de política | Sin reintento ni fallback. | `failed` (`ai_refused`). |
 | `429` de notificación | Reintentos con backoff y token bucket. | `sent` o `failed` (`provider_rate_limited`). |
 | `5xx` de notificación | Reintentos; luego fallo terminal. | `failed` (`provider_unavailable`). |
@@ -651,8 +669,9 @@ local, no la base multi-instancia.
 ## 11. Pruebas
 
 - **Unitarias de guardrails:** JSON limpio, alias, Markdown, texto embebido,
-  truncado, comillas simples, claves sin comillas, campos ausentes, rechazos y
-  calidad del mensaje.
+  truncado, comillas simples, claves sin comillas, campos ausentes, rechazos,
+  calidad del mensaje, destinatario inventado, múltiples destinos, mensaje
+  incompleto y mensaje demasiado largo.
 - **Unitarias de repositorio:** transiciones, idempotencia y estados terminales,
   tanto en memoria como en SQLite.
 - **SQLite:** persistencia tras cerrar y reabrir, replay de idempotencia,
@@ -663,6 +682,10 @@ local, no la base multi-instancia.
   fallback, fallo de proveedor, validación, 404, health checks, idempotencia de
   creación, autenticación opcional, límite de cuerpo, métricas y persistencia
   SQLite entre lifespans.
+- **Integración semántica:** destinatario del LLM distinto, destino ambiguo,
+  email dentro del mensaje, mensaje incompleto y mensaje demasiado largo.
+
+La suite actual tiene **76 tests**.
 
 Ejecución:
 
@@ -675,23 +698,23 @@ python -m venv .venv
 El workflow `.github/workflows/ci.yml` ejecuta la misma suite en Python 3.12.
 No levanta Docker ni k6; la carga sigue siendo una verificación manual.
 
-### 11.1 Última validación de carga
+### 11.1 Validación de carga de referencia
 
 Medición local con Docker Desktop, provider real y k6:
 
 | Métrica | Resultado |
 |---|---|
 | Escenario | 200 VUs, 40 s |
-| Checks | 19.201 / 100 % correctos |
+| Checks | 19.173 / 100 % correctos |
 | Fallos HTTP | 0 |
-| `http_req_duration` p95 | 5,81 ms |
-| `http_req_duration` p90 | 4,37 ms |
-| Peticiones HTTP | 8.229 (198,3/s) |
-| Iteraciones | 2.743 |
-| Estado al drenar | 2.440 `sent`, 306 `ai_refused`, colas a 0 (acumulado de la sesión) |
+| `http_req_duration` p95 | 9,07 ms |
+| `http_req_duration` p90 | 5,81 ms |
+| Peticiones HTTP | 8.217 (198,0/s) |
+| Iteraciones | 2.739 |
+| Estado inmediato | 192 `sent`, 90 `ai_refused`, 1.909 en extracción y 500 en entrega |
 
 El backlog es el comportamiento esperado: el proveedor limita la entrega a 50
-notificaciones cada 10 s. La API mantuvo p95 por debajo de 6 ms porque el
+notificaciones cada 10 s. La API mantuvo p95 por debajo de 10 ms porque el
 `/process` solo encola. El build de la imagen, el healthcheck del contenedor y
 la condición `service_healthy` de compose también se validaron en esta prueba.
 Además se verificó que el estado sobrevive a un reinicio del contenedor y que

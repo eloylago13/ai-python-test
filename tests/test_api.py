@@ -191,6 +191,54 @@ async def test_unparseable_ai_output_falls_back_to_deterministic_extraction() ->
             assert provider.notifications[0].message == "hola"
 
 
+async def test_wrong_llm_recipient_is_replaced_by_the_requested_one() -> None:
+    provider = FakeProvider(
+        ai_responses=[
+            '{"to": "juan@example.com", "message": "hola", "type": "email"}'
+        ]
+    )
+    app = create_app(settings=settings(), provider=provider)
+
+    async with app.router.lifespan_context(app):
+        async with client_for(app) as client:
+            created = await client.post(
+                "/v1/requests",
+                json={"user_input": USER_INPUT},
+            )
+            request_id = created.json()["id"]
+            await client.post(f"/v1/requests/{request_id}/process")
+            await wait_for_status(client, request_id, {"sent"})
+
+            assert len(provider.notifications) == 1
+            assert provider.notifications[0].to == "feda@test.com"
+
+
+async def test_ambiguous_destination_ends_in_failed_state() -> None:
+    provider = FakeProvider(
+        ai_responses=[
+            '{"to": "a@test.com", "message": "hola", "type": "email"}'
+        ]
+    )
+    app = create_app(settings=settings(), provider=provider)
+
+    async with app.router.lifespan_context(app):
+        async with client_for(app) as client:
+            created = await client.post(
+                "/v1/requests",
+                json={
+                    "user_input": (
+                        "Envia el mensaje a a@test.com y tambien a b@test.com"
+                    )
+                },
+            )
+            request_id = created.json()["id"]
+            await client.post(f"/v1/requests/{request_id}/process")
+
+            final = await wait_for_status(client, request_id, {"failed"})
+            assert final["error_code"] == "ambiguous_destination"
+            assert provider.notifications == []
+
+
 async def test_notification_provider_failure_ends_in_failed_state() -> None:
     provider = FakeProvider(
         notify_error=ProviderError(
